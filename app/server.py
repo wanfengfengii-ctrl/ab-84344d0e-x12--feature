@@ -25,6 +25,13 @@ POST /api/x12/audit
           }
         }
 
+    With an ``X-Partner-Profile`` header, transport checks and the
+    envelope audit run first; an unknown profile yields 400
+    ``PROFILE_NOT_FOUND``, and a valid envelope that violates the
+    selected profile yields 422 ``PROFILE_MISMATCH`` with ``scope`` and
+    the first violating ``segment``.  Omitting the header preserves the
+    original behavior exactly.
+
 GET /health
     Liveness/readiness probe.  Returns ``{"status": "ok"}`` with 200 once the
     HTTP server is accepting connections.
@@ -35,13 +42,25 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .audit import MAX_MESSAGE_BYTES, EnvelopeError, audit
+from .audit import MAX_MESSAGE_BYTES, EnvelopeError, audit_with_view
+from .profiles import (
+    ENV_VAR as PROFILE_ENV_VAR,
+)
+from .profiles import (
+    PartnerProfile,
+    ProfileConfigError,
+    ProfileMismatch,
+    load_profiles_from_env,
+    match as match_profile,
+)
 
 AUDIT_PATH = "/api/x12/audit"
 HEALTH_PATH = "/health"
+PROFILE_HEADER = "X-Partner-Profile"
 
 logger = logging.getLogger("x12-audit")
 
@@ -170,9 +189,36 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Profile selection happens after the transport checks but before
+        # the envelope audit: an unknown profile is a request error in its
+        # own right; a selected profile is only matched after the original
+        # envelope audit has fully passed.
+        profile_header = self.headers.get(PROFILE_HEADER)
+        profile: PartnerProfile | None = None
+        if profile_header is not None:
+            profiles = getattr(self.server, "partner_profiles", None) or {}
+            profile = profiles.get(profile_header)
+            if profile is None:
+                keep_alive = self._drain(length)
+                logger.info("unknown partner profile: %r", profile_header)
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": {
+                            "code": "PROFILE_NOT_FOUND",
+                            "message": (
+                                f"unknown partner profile {profile_header!r}"
+                            ),
+                        }
+                    },
+                    close=not keep_alive,
+                )
+                return
+
         raw = self.rfile.read(length) if length else b""
+
         try:
-            result = audit(raw)
+            result, view = audit_with_view(raw)
         except EnvelopeError as exc:
             logger.info("audit failed: %s at segment %s", exc.code, exc.segment)
             self._send_json(
@@ -186,6 +232,29 @@ class AuditHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+
+        if profile is not None:
+            try:
+                match_profile(profile, view)
+            except ProfileMismatch as exc:
+                logger.info(
+                    "profile %r mismatch: %s at segment %s",
+                    profile.name,
+                    exc.scope,
+                    exc.segment,
+                )
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": {
+                            "code": "PROFILE_MISMATCH",
+                            "message": str(exc),
+                            "scope": exc.scope,
+                            "segment": exc.segment,
+                        }
+                    },
+                )
+                return
 
         self._send_json(
             HTTPStatus.OK,
@@ -201,9 +270,20 @@ class AuditHandler(BaseHTTPRequestHandler):
         logger.debug(fmt, *args)
 
 
-def create_server(host: str, port: int) -> ThreadingHTTPServer:
+def create_server(
+    host: str,
+    port: int,
+    profiles: dict[str, PartnerProfile] | None = None,
+) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), AuditHandler)
+    server.partner_profiles = dict(profiles or {})
     logger.info("listening on http://%s:%s", host, port)
+    if profiles:
+        logger.info(
+            "loaded %d partner profile(s): %s",
+            len(profiles),
+            ", ".join(sorted(profiles)),
+        )
     return server
 
 
@@ -212,9 +292,14 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    try:
+        profiles = load_profiles_from_env()
+    except ProfileConfigError as exc:
+        logger.error("invalid %s configuration: %s", PROFILE_ENV_VAR, exc)
+        sys.exit(2)
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
-    server = create_server(host, port)
+    server = create_server(host, port, profiles)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

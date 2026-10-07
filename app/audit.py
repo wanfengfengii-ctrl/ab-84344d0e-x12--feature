@@ -19,6 +19,11 @@ Every error is reported at the first segment where it is locatable.  Because
 segments are processed strictly in document order, an inner envelope error
 (SE/GE level) is always raised before any later outer summary (IEA level)
 could mask it.
+
+:func:`audit_with_view` additionally returns the profile-relevant identity
+of the envelope (ISA05..08 with right-hand space padding removed, plus each
+group's GS01/GS02/GS03/GS08 and every ST01) used for partner-profile
+matching; :func:`audit` keeps the original signature.
 """
 
 from __future__ import annotations
@@ -57,10 +62,47 @@ class AuditResult:
     sha256: str
 
 
+@dataclass(frozen=True)
+class TransactionView:
+    """Identity of one ST/SE transaction, for partner-profile matching."""
+
+    st_index: int
+    transaction_set_id: str
+
+
+@dataclass(frozen=True)
+class GroupView:
+    """Identity of one GS/GE group, for partner-profile matching."""
+
+    gs_index: int
+    functional_identifier: str
+    application_sender: str
+    application_receiver: str
+    version: str
+    transactions: tuple[TransactionView, ...]
+
+
+@dataclass(frozen=True)
+class EnvelopeView:
+    """Profile-relevant identity extracted from an audited envelope.
+
+    ISA05..ISA08 are fixed-width fields: only right-hand space padding is
+    removed; leading spaces and letter case are preserved.  GS/ST
+    identifiers are carried verbatim and compared case-sensitively.
+    """
+
+    sender_qualifier: str
+    sender_id: str
+    receiver_qualifier: str
+    receiver_id: str
+    groups: tuple[GroupView, ...]
+
+
 @dataclass
 class _Transaction:
     st_index: int
     control_number: bytes
+    transaction_set_id: str
 
 
 @dataclass
@@ -68,6 +110,10 @@ class _Group:
     gs_index: int
     control_number: bytes
     transactions: list[_Transaction]
+    functional_identifier: str
+    application_sender: str
+    application_receiver: str
+    version: str
 
 
 def _is_printable_punctuation(value: int) -> bool:
@@ -77,8 +123,12 @@ def _is_printable_punctuation(value: int) -> bool:
     return not (ch.isalnum() or ch == " ")
 
 
-def audit(raw: bytes) -> AuditResult:
-    """Audit a raw X12 message and return its envelope summary."""
+def audit_with_view(raw: bytes) -> tuple[AuditResult, EnvelopeView]:
+    """Audit a raw X12 message.
+
+    Returns both the envelope summary and the profile-relevant identity
+    view.  Raises :class:`EnvelopeError` on the first envelope violation.
+    """
 
     if len(raw) == 0:
         raise EnvelopeError("EMPTY_MESSAGE", "request body is empty", 1)
@@ -147,6 +197,14 @@ def audit(raw: bytes) -> AuditResult:
             1,
         )
     interchange_control = isa_parts[13].decode("ascii").strip()
+
+    # Identity fields used by partner profiles.  These are fixed-width ISA
+    # elements, so only right-hand space padding is stripped; letter case
+    # and leading spaces are significant.
+    isa_sender_qualifier = isa_parts[5].decode("ascii").rstrip(" ")
+    isa_sender_id = isa_parts[6].decode("ascii").rstrip(" ")
+    isa_receiver_qualifier = isa_parts[7].decode("ascii").rstrip(" ")
+    isa_receiver_id = isa_parts[8].decode("ascii").rstrip(" ")
 
     raw_tokens = raw.split(terminator_byte)
     if raw_tokens[0] != isa_core:
@@ -236,6 +294,10 @@ def audit(raw: bytes) -> AuditResult:
                 gs_index=position,
                 control_number=parts[6],
                 transactions=[],
+                functional_identifier=parts[1].decode("ascii"),
+                application_sender=parts[2].decode("ascii"),
+                application_receiver=parts[3].decode("ascii"),
+                version=parts[8].decode("ascii"),
             )
             groups.append(current_group)
 
@@ -269,6 +331,7 @@ def audit(raw: bytes) -> AuditResult:
             current_txn = _Transaction(
                 st_index=position,
                 control_number=parts[2],
+                transaction_set_id=parts[1].decode("ascii"),
             )
 
         elif tag == b"SE":
@@ -449,9 +512,38 @@ def audit(raw: bytes) -> AuditResult:
         )
 
     transaction_count = sum(len(group.transactions) for group in groups)
-    return AuditResult(
+    result = AuditResult(
         interchange_control_number=interchange_control,
         group_count=len(groups),
         transaction_count=transaction_count,
         sha256=hashlib.sha256(raw).hexdigest(),
     )
+    view = EnvelopeView(
+        sender_qualifier=isa_sender_qualifier,
+        sender_id=isa_sender_id,
+        receiver_qualifier=isa_receiver_qualifier,
+        receiver_id=isa_receiver_id,
+        groups=tuple(
+            GroupView(
+                gs_index=group.gs_index,
+                functional_identifier=group.functional_identifier,
+                application_sender=group.application_sender,
+                application_receiver=group.application_receiver,
+                version=group.version,
+                transactions=tuple(
+                    TransactionView(
+                        st_index=txn.st_index,
+                        transaction_set_id=txn.transaction_set_id,
+                    )
+                    for txn in group.transactions
+                ),
+            )
+            for group in groups
+        ),
+    )
+    return result, view
+
+
+def audit(raw: bytes) -> AuditResult:
+    """Audit a raw X12 message and return its envelope summary."""
+    return audit_with_view(raw)[0]

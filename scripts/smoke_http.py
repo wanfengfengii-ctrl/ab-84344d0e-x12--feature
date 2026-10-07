@@ -54,11 +54,18 @@ GS = "GS*PO*SENDER*PARTNER*20240101*1200*1*X*005010~"
 IEA = "IEA*1*000000001~"
 
 
-def post(raw: bytes, content_type: str = "application/octet-stream"):
+def post(
+    raw: bytes,
+    content_type: str = "application/octet-stream",
+    extra_headers: dict | None = None,
+):
+    headers = {"Content-Type": content_type}
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         ENDPOINT,
         data=raw,
-        headers={"Content-Type": content_type},
+        headers=headers,
         method="POST",
     )
     try:
@@ -203,6 +210,129 @@ def scenario_damaged():
     )
 
 
+def expect_profile_error(
+    name, body: bytes, profile_name: str, scope: str, segment: int
+):
+    print(f"scenario: {name}")
+    status, payload = post(
+        body, extra_headers={"X-Partner-Profile": profile_name}
+    )
+    error = payload.get("error", {})
+    check("http 422", status == 422, f"got {status} {payload}")
+    check("error code", error.get("code") == "PROFILE_MISMATCH", str(payload))
+    check("scope", error.get("scope") == scope, str(payload))
+    check("first violating segment", error.get("segment") == segment, str(payload))
+    check("message present", bool(error.get("message")), str(payload))
+
+
+def scenario_partner_profiles():
+    # Mirrors the "acme" profile shipped via X12_PARTNER_PROFILES in
+    # docker-compose.yml: ISA ZZ/SENDER -> ZZ/PARTNER, GS02 SENDER,
+    # GS03 PARTNER, GS01 PO / GS08 005010 allows ST01 850.
+    acme_gs = "GS*PO*SENDER*PARTNER*20240101*1200*1*X*005010~"
+    acme_body = (isa() + acme_gs + "ST*850*100~SE*2*100~GE*1*1~" + IEA).encode()
+
+    print("scenario: profile header omitted stays compatible")
+    status, payload = post(acme_body)
+    check("http 200", status == 200, f"got {status} {payload}")
+
+    print("scenario: profile header matches")
+    status, payload = post(
+        acme_body, extra_headers={"X-Partner-Profile": "acme"}
+    )
+    check("http 200", status == 200, f"got {status} {payload}")
+    check("transaction count", payload.get("transaction_count") == 1, str(payload))
+
+    print("scenario: unknown partner profile")
+    status, payload = post(
+        acme_body, extra_headers={"X-Partner-Profile": "ghost"}
+    )
+    check("http 400", status == 400, f"got {status} {payload}")
+    check(
+        "error code",
+        payload.get("error", {}).get("code") == "PROFILE_NOT_FOUND",
+        str(payload),
+    )
+
+    print("scenario: unknown profile beats a damaged envelope")
+    status, payload = post(
+        b"", extra_headers={"X-Partner-Profile": "ghost"}
+    )
+    check("http 400", status == 400, f"got {status} {payload}")
+    check(
+        "error code",
+        payload.get("error", {}).get("code") == "PROFILE_NOT_FOUND",
+        str(payload),
+    )
+
+    print("scenario: envelope audit beats a profile mismatch")
+    # Wrong ISA sender (would mismatch "acme") but also a missing final
+    # terminator: the original envelope error must surface first.
+    bad_isa_fields = [
+        "00",
+        " " * 10,
+        "00",
+        " " * 10,
+        "ZZ",
+        "INTRUDER".ljust(15),
+        "ZZ",
+        "PARTNER".ljust(15),
+        " " * 6,
+        " " * 4,
+        "U",
+        "00501",
+        "000000001".rjust(9),
+        "0",
+        "P",
+        ":",
+    ]
+    bad_isa = "ISA*" + "*".join(bad_isa_fields) + "~"
+    damaged = (bad_isa + acme_gs + "ST*850*100~SE*2*100~GE*1*1~IEA*1*000000001").encode()
+    status, payload = post(
+        damaged, extra_headers={"X-Partner-Profile": "acme"}
+    )
+    check("http 422", status == 422, f"got {status} {payload}")
+    check(
+        "envelope error wins",
+        payload.get("error", {}).get("code") == "MISSING_TERMINATOR",
+        str(payload),
+    )
+
+    expect_profile_error(
+        "interchange sender mismatch",
+        (bad_isa + acme_gs + "ST*850*100~SE*2*100~GE*1*1~" + IEA).encode(),
+        "acme",
+        "interchange",
+        1,
+    )
+
+    expect_profile_error(
+        "GS02 mismatch",
+        (isa() + "GS*PO*OTHER*PARTNER*20240101*1200*1*X*005010~"
+         + "ST*850*100~SE*2*100~GE*1*1~" + IEA).encode(),
+        "acme",
+        "group",
+        2,
+    )
+
+    expect_profile_error(
+        "uncontracted GS01/GS08 pair",
+        (isa() + "GS*FA*SENDER*PARTNER*20240101*1200*1*X*005010~"
+         + "ST*997*100~SE*2*100~GE*1*1~" + IEA).encode(),
+        "acme",
+        "group",
+        2,
+    )
+
+    expect_profile_error(
+        "forbidden transaction set",
+        (isa() + acme_gs + "ST*997*100~SE*2*100~GE*1*1~" + IEA).encode(),
+        "acme",
+        "transaction",
+        3,
+    )
+
+
 def scenario_transport():
     print("scenario: wrong content type")
     status, payload = post(b"whatever", "text/plain")
@@ -240,6 +370,7 @@ def main() -> int:
     print(f"Smoke testing X12 audit API at {ENDPOINT}")
     scenario_valid()
     scenario_damaged()
+    scenario_partner_profiles()
     scenario_transport()
     print()
     if failures:

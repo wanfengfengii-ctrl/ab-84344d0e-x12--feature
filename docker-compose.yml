@@ -10,6 +10,31 @@ services:
       PORT: "8080"
       HOST: "0.0.0.0"
       LOG_LEVEL: "INFO"
+      # Trading-partner profiles (1..16 unique entries).  Each entry
+      # declares ISA05/06/07/08, GS02/03 and 1..8 group contracts of
+      # GS01 + GS08 + allowed ST01 codes.  Selected per request with the
+      # X-Partner-Profile header; absent/blank disables profiling.
+      X12_PARTNER_PROFILES: |-
+        [
+          {
+            "name": "acme",
+            "ISA05": "ZZ", "ISA06": "SENDER",
+            "ISA07": "ZZ", "ISA08": "PARTNER",
+            "GS02": "SENDER", "GS03": "PARTNER",
+            "groups": [
+              {"GS01": "PO", "GS08": "005010", "ST01": ["850", "855"]}
+            ]
+          },
+          {
+            "name": "beta",
+            "ISA05": "ZZ", "ISA06": "BETA",
+            "ISA07": "ZZ", "ISA08": "PARTNER",
+            "GS02": "BETA", "GS03": "PARTNER",
+            "groups": [
+              {"GS01": "FA", "GS08": "005010", "ST01": ["997", "999"]}
+            ]
+          }
+        ]
     ports:
       # Host port is configurable: HOST_PORT=9090 docker compose up
       - "${HOST_PORT:-8080}:8080"
