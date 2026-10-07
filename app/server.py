@@ -25,6 +25,18 @@ POST /api/x12/audit
           }
         }
 
+    The optional ``X-Partner-Profile`` request header names a partner
+    profile from the ``X12_PARTNER_PROFILES`` registry.  When present, a
+    structurally valid envelope is additionally checked against that
+    profile (interchange parties, functional groups, transactions):
+
+    * unknown profile -> 400 ``PROFILE_NOT_FOUND``
+    * first violation -> 422 ``PROFILE_MISMATCH`` with ``scope``
+      (``interchange``/``group``/``transaction``) and the 1-based
+      ``segment`` index of the offending segment
+
+    Without the header the behaviour is exactly the plain envelope audit.
+
 GET /health
     Liveness/readiness probe.  Returns ``{"status": "ok"}`` with 200 once the
     HTTP server is accepting connections.
@@ -39,9 +51,17 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import MAX_MESSAGE_BYTES, EnvelopeError, audit
+from .profiles import (
+    PartnerProfile,
+    ProfileConfigError,
+    ProfileMismatch,
+    check_envelope_against_profile,
+    load_profiles,
+)
 
 AUDIT_PATH = "/api/x12/audit"
 HEALTH_PATH = "/health"
+PROFILE_HEADER = "X-Partner-Profile"
 
 logger = logging.getLogger("x12-audit")
 
@@ -187,6 +207,50 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # The envelope audit above always runs first; only a structurally
+        # valid interchange is checked against a requested partner profile.
+        profile_name = self.headers.get(PROFILE_HEADER)
+        if profile_name is not None:
+            profiles: dict[str, PartnerProfile] = getattr(
+                self.server, "profiles", {}
+            )
+            profile = profiles.get(profile_name)
+            if profile is None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": {
+                            "code": "PROFILE_NOT_FOUND",
+                            "message": (
+                                f"unknown partner profile {profile_name!r}"
+                            ),
+                        }
+                    },
+                )
+                return
+            try:
+                check_envelope_against_profile(result.envelope, profile)
+            except ProfileMismatch as exc:
+                logger.info(
+                    "profile %r rejected message: %s (scope=%s, segment=%s)",
+                    profile_name,
+                    exc,
+                    exc.scope,
+                    exc.segment,
+                )
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": {
+                            "code": "PROFILE_MISMATCH",
+                            "message": str(exc),
+                            "scope": exc.scope,
+                            "segment": exc.segment,
+                        }
+                    },
+                )
+                return
+
         self._send_json(
             HTTPStatus.OK,
             {
@@ -201,8 +265,13 @@ class AuditHandler(BaseHTTPRequestHandler):
         logger.debug(fmt, *args)
 
 
-def create_server(host: str, port: int) -> ThreadingHTTPServer:
+def create_server(
+    host: str,
+    port: int,
+    profiles: dict[str, PartnerProfile] | None = None,
+) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), AuditHandler)
+    server.profiles = profiles or {}
     logger.info("listening on http://%s:%s", host, port)
     return server
 
@@ -212,9 +281,16 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    try:
+        profiles = load_profiles(os.environ.get("X12_PARTNER_PROFILES"))
+    except ProfileConfigError as exc:
+        logger.error("invalid X12_PARTNER_PROFILES: %s", exc)
+        raise SystemExit(1)
+    if profiles:
+        logger.info("loaded %d partner profile(s)", len(profiles))
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
-    server = create_server(host, port)
+    server = create_server(host, port, profiles)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,3 +1,29 @@
+# Partner profile registry, shared by both services: the api enforces it on
+# requests carrying X-Partner-Profile, verify derives its match/reject
+# scenarios from the same document.  Must be a JSON array of 1..16 unique
+# profiles; see README.md ("合作方画像") for the schema.  An invalid document
+# makes the api process exit non-zero at startup.
+x-partner-profiles: &partner-profiles >-
+  [
+    {
+      "name": "acme-po",
+      "isa05": "ZZ", "isa06": "ACME-SENDER", "isa07": "ZZ", "isa08": "HUB-RECEIVER",
+      "gs02": "ACMEAPP", "gs03": "HUBAPP",
+      "groups": [
+        {"gs01": "PO", "gs08": "005010", "st01": ["850", "855"]},
+        {"gs01": "IN", "gs08": "004010", "st01": ["810"]}
+      ]
+    },
+    {
+      "name": "retail-ship",
+      "isa05": "01", "isa06": "RETAILER", "isa07": "01", "isa08": "HUB-RECEIVER",
+      "gs02": "RETAILAPP", "gs03": "HUBAPP",
+      "groups": [
+        {"gs01": "SH", "gs08": "005010", "st01": ["856"]}
+      ]
+    }
+  ]
+
 services:
   api:
     build:
@@ -10,6 +36,7 @@ services:
       PORT: "8080"
       HOST: "0.0.0.0"
       LOG_LEVEL: "INFO"
+      X12_PARTNER_PROFILES: *partner-profiles
     ports:
       # Host port is configurable: HOST_PORT=9090 docker compose up
       - "${HOST_PORT:-8080}:8080"
@@ -36,6 +63,7 @@ services:
     environment:
       BASE_URL: "http://api:8080"
       HEALTH_TIMEOUT: "60"
+      X12_PARTNER_PROFILES: *partner-profiles
     depends_on:
       api:
         condition: service_healthy

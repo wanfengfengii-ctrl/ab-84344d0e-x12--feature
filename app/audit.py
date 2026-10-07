@@ -50,17 +50,55 @@ class EnvelopeError(Exception):
 
 
 @dataclass(frozen=True)
+class TransactionDetail:
+    """ST01 of one transaction set and the 1-based index of its ST segment."""
+
+    segment: int
+    st01: str
+
+
+@dataclass(frozen=True)
+class GroupDetail:
+    """GS header fields of one functional group and its transactions."""
+
+    segment: int
+    gs01: str
+    gs02: str
+    gs03: str
+    gs08: str
+    transactions: tuple[TransactionDetail, ...]
+
+
+@dataclass(frozen=True)
+class EnvelopeDetail:
+    """Identity fields captured while auditing, for partner profile checks.
+
+    Values are kept exactly as they appear on the wire (ISA fields still
+    carry their fixed-width padding); any normalization is left to the
+    profile matcher.
+    """
+
+    isa05: str
+    isa06: str
+    isa07: str
+    isa08: str
+    groups: tuple[GroupDetail, ...]
+
+
+@dataclass(frozen=True)
 class AuditResult:
     interchange_control_number: str
     group_count: int
     transaction_count: int
     sha256: str
+    envelope: EnvelopeDetail
 
 
 @dataclass
 class _Transaction:
     st_index: int
     control_number: bytes
+    st01: bytes
 
 
 @dataclass
@@ -68,6 +106,10 @@ class _Group:
     gs_index: int
     control_number: bytes
     transactions: list[_Transaction]
+    gs01: bytes
+    gs02: bytes
+    gs03: bytes
+    gs08: bytes
 
 
 def _is_printable_punctuation(value: int) -> bool:
@@ -236,6 +278,10 @@ def audit(raw: bytes) -> AuditResult:
                 gs_index=position,
                 control_number=parts[6],
                 transactions=[],
+                gs01=parts[1],
+                gs02=parts[2],
+                gs03=parts[3],
+                gs08=parts[8],
             )
             groups.append(current_group)
 
@@ -269,6 +315,7 @@ def audit(raw: bytes) -> AuditResult:
             current_txn = _Transaction(
                 st_index=position,
                 control_number=parts[2],
+                st01=parts[1],
             )
 
         elif tag == b"SE":
@@ -449,9 +496,33 @@ def audit(raw: bytes) -> AuditResult:
         )
 
     transaction_count = sum(len(group.transactions) for group in groups)
+    envelope = EnvelopeDetail(
+        isa05=isa_parts[5].decode("ascii"),
+        isa06=isa_parts[6].decode("ascii"),
+        isa07=isa_parts[7].decode("ascii"),
+        isa08=isa_parts[8].decode("ascii"),
+        groups=tuple(
+            GroupDetail(
+                segment=group.gs_index,
+                gs01=group.gs01.decode("ascii"),
+                gs02=group.gs02.decode("ascii"),
+                gs03=group.gs03.decode("ascii"),
+                gs08=group.gs08.decode("ascii"),
+                transactions=tuple(
+                    TransactionDetail(
+                        segment=txn.st_index,
+                        st01=txn.st01.decode("ascii"),
+                    )
+                    for txn in group.transactions
+                ),
+            )
+            for group in groups
+        ),
+    )
     return AuditResult(
         interchange_control_number=interchange_control,
         group_count=len(groups),
         transaction_count=transaction_count,
         sha256=hashlib.sha256(raw).hexdigest(),
+        envelope=envelope,
     )
